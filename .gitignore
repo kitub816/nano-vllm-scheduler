@@ -193,3 +193,15 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
+# Local environments
+.venv/
+__pycache__/
+*.pyc
+
+# Downloaded packages
+*.whl
+
+# Local benchmark artifacts; curated baselines live under benchmarks/baselines/
+/results/
+/results_*/
+*.safetensors

@@ -1,0 +1,37 @@
+{
+  "source_commit": "bc6eba880eeb805289836f2d827e98a8800c814d",
+  "workload_sha256": "525cf90c6681ab54cbf59499062a7a3d4bfcb796a1e421333e4a899669c9a3f1",
+  "raw_artifacts_uploaded": false,
+  "files": [
+    {
+      "file": "workload.json",
+      "source": "results/workload.json",
+      "bytes": 36812,
+      "sha256": "e23d23e105a180853f51531035cad755f1b9ffcf4fbe954c7e54eefbdb31ba97"
+    },
+    {
+      "file": "summary.csv",
+      "source": "results_reliability/summary.csv",
+      "bytes": 4026,
+      "sha256": "9b40837e81dcf555f536c8c0797a1734119001700eee0c7a61daf9dd06acfc51"
+    },
+    {
+      "file": "cross_run_statistics.csv",
+      "source": "results_reliability/cross_run_statistics.csv",
+      "bytes": 10449,
+      "sha256": "a6629bab8ea462c8e4296398a43dc3a32c4dd6439889e413bb583c5ad7f8a1d6"
+    },
+    {
+      "file": "decode_batch_statistics.csv",
+      "source": "results_reliability/decode_batch_statistics.csv",
+      "bytes": 2779,
+      "sha256": "903a913c9f577111f4f80c392347f12df2a06fc024dcd4558583b76ca31aae17"
+    },
+    {
+      "file": "baseline_global_top10.csv",
+      "source": "results_reliability/baseline_global_top10.csv",
+      "bytes": 862,
+      "sha256": "af76887477d34fb59b68ceddfaaf2c9daf7fc7802b3198083343262a653c6d93"
+    }
+  ]
+}
