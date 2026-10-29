@@ -11,6 +11,7 @@ class Scheduler:
         self.max_num_seqs = config.max_num_seqs  #本轮处理请求数
         self.max_num_batched_tokens = config.max_num_batched_tokens
         self.scheduling_policy = config.scheduling_policy
+        self.decode_queue_policy = config.decode_queue_policy
         self.max_consecutive_decode_steps = config.max_consecutive_decode_steps
         self.consecutive_decode_steps = 0
         self.eos = config.eos
@@ -105,7 +106,12 @@ class Scheduler:
                 seq.is_prefill = False
                 self.block_manager.may_append(seq)
                 scheduled_seqs.append(seq)
-        self.running.extendleft(reversed(scheduled_seqs))
+        if self.decode_queue_policy == "round_robin":
+            # Restore only after selection/preemption, so a request cannot be
+            # selected twice or become a preemption victim in the same batch.
+            self.running.extend(scheduled_seqs)
+        else:
+            self.running.extendleft(reversed(scheduled_seqs))
         return scheduled_seqs
 
     def preempt(self, seq: Sequence):

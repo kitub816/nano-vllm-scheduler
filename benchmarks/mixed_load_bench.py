@@ -30,7 +30,11 @@ POLICIES = {
     "prefill_first": ("prefill_first", 0),
     "decode_first": ("decode_first", 0),
     "decode_first_fair2": ("decode_first", 2),
+    "prefill_first_rr": ("prefill_first", 0),
+    "decode_first_fair2_rr": ("decode_first", 2),
 }
+DEFAULT_POLICIES = ("prefill_first", "decode_first", "decode_first_fair2")
+ROUND_ROBIN_POLICIES = ("prefill_first_rr", "decode_first_fair2_rr")
 
 
 @dataclass
@@ -273,7 +277,8 @@ def warmup(engine, rounds):
 def run_identity(policy, repeat):
     scheduling_policy, threshold = POLICIES[policy]
     return dict(policy=policy, scheduling_policy=scheduling_policy,
-                max_consecutive_decode_steps=threshold, repeat=repeat)
+                max_consecutive_decode_steps=threshold, repeat=repeat,
+                decode_queue_policy="round_robin" if policy in ROUND_ROBIN_POLICIES else "head_first")
 
 
 def load_specs(manifest):
@@ -344,6 +349,7 @@ def run_worker(manifest_path, output_path, policy, repeat):
             environment[package] = importlib.metadata.version(package)
         scheduling_policy, threshold = POLICIES[policy]
         engine = LLM(options["model"], scheduling_policy=scheduling_policy,
+                     decode_queue_policy=run_identity(policy, repeat)["decode_queue_policy"],
                      max_consecutive_decode_steps=threshold, tensor_parallel_size=1,
                      enforce_eager=True, max_model_len=options["max_model_len"],
                      max_num_batched_tokens=options["max_num_batched_tokens"],
@@ -486,7 +492,7 @@ def parse_args(argv=None):
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--arrival-interval", type=float, default=0.02, help="seconds between arrivals after initial burst")
     parser.add_argument("--initial-burst", type=int, default=4)
-    parser.add_argument("--policies", nargs="+", choices=list(POLICIES), default=list(POLICIES))
+    parser.add_argument("--policies", nargs="+", choices=list(POLICIES), default=list(DEFAULT_POLICIES))
     parser.add_argument("--repeats", type=positive_int, default=1)
     parser.add_argument("--order-mode", choices=("fixed", "rotate"), default="fixed")
     parser.add_argument("--workload-from", type=Path,

@@ -19,10 +19,13 @@ class Config:
     num_kvcache_blocks: int = -1
     scheduling_policy: str = "prefill_first"
     max_consecutive_decode_steps: int = 0
+    decode_queue_policy: str = "head_first"
 
     def __post_init__(self):
         if self.scheduling_policy not in ("prefill_first", "decode_first"):
             raise ValueError(f"Unsupported scheduling policy: {self.scheduling_policy!r}")
+        if self.decode_queue_policy not in ("head_first", "round_robin"):
+            raise ValueError(f"Unsupported decode_queue_policy: {self.decode_queue_policy!r}")
         if type(self.max_consecutive_decode_steps) is not int or self.max_consecutive_decode_steps < 0:
             raise ValueError(
                 "max_consecutive_decode_steps must be a non-negative integer, "

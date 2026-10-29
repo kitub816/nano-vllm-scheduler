@@ -159,6 +159,8 @@ def write_results(output_dir, runs, metadata):
     for run in runs:
         identity = {key: run["summary"][key] for key in
                     ("policy", "scheduling_policy", "max_consecutive_decode_steps", "repeat")}
+        if "decode_queue_policy" in run["summary"]:
+            identity["decode_queue_policy"] = run["summary"]["decode_queue_policy"]
         rows.extend({**identity, **row} for row in run["requests"])
     with (output_dir / "raw_requests.csv").open("w", newline="", encoding="utf-8") as file:
         fields = list(rows[0]) if rows else ["policy", "request_id"]

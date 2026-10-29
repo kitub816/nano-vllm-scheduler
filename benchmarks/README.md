@@ -150,3 +150,29 @@ GPU 温度、SM/显存频率、功耗和利用率只在正式窗口前后读取�
 及中文分析报告。跨运行统计对每次运行的指标求均值、样本标准差（ddof=1）、
 最小/最大值；不混合原始样本重算分位数。旧实验没有逐轮 trace，分析器不会
 伪造它的精确批大小分布或轮次耗时。
+
+## 第四阶段：running 内部 Decode 队列策略
+
+Config 新增 `decode_queue_policy="head_first"`（默认）或 `"round_robin"`。
+它独立于 `scheduling_policy` 和 `max_consecutive_decode_steps`：前者控制 running
+内部下一轮的优先顺序，后两者仍控制 Prefill/Decode 跨阶段优先级。
+
+原三策略 CLI 默认值保持不变。四组队列对照实验显式指定：
+
+```bash
+.venv/bin/python -m benchmarks.mixed_load_bench \
+  --workload-from benchmarks/baselines/stage3/workload.json \
+  --policies prefill_first prefill_first_rr decode_first_fair2 decode_first_fair2_rr \
+  --repeats 3 --order-mode rotate --output-dir results_stage4
+.venv/bin/python -m benchmarks.decode_queue_analysis \
+  --baseline results --results results_stage4
+```
+
+两个 `_rr` 标签启用 round_robin，其余标签保留 head_first；实际配置写入每次
+summary 和请求 CSV。实验和暖机复用第三阶段实现，结果目录仍被 Git 忽略。
+
+分析报告见 `decode_queue_analysis_zh.md`；`first_to_second.csv` 单独保存每请求的
+首→第二 Token 间隔（每次 12 个样本），与全体 ITL（每次 480 个样本）分开统计。
+`queue_run_metrics.csv`、`queue_cross_run_statistics.csv` 和 `queue_analysis.json`
+保存逐次与跨运行指标。源码核心 Diff 另存本地结果目录的 `source.diff`。
+4 组但只有 3 次重复时，简单 rotate 不能完全平衡 4 个执行位置，报告会保留这一限制。
