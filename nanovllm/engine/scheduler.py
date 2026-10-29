@@ -11,6 +11,8 @@ class Scheduler:
         self.max_num_seqs = config.max_num_seqs  #本轮处理请求数
         self.max_num_batched_tokens = config.max_num_batched_tokens
         self.scheduling_policy = config.scheduling_policy
+        self.max_consecutive_decode_steps = config.max_consecutive_decode_steps
+        self.consecutive_decode_steps = 0
         self.eos = config.eos
         self.block_size = config.kvcache_block_size
         self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size)
@@ -30,9 +32,19 @@ class Scheduler:
         # Retry prefill after decode if preemption moved running requests back
         # to waiting. Each successful call still returns only one batch type.
         phases = (False, True) if self.scheduling_policy == "decode_first" else (True, False, True)
+        fairness_enabled = self.scheduling_policy == "decode_first" and self.max_consecutive_decode_steps > 0
+        if (fairness_enabled and self.waiting
+                and self.consecutive_decode_steps >= self.max_consecutive_decode_steps):
+            phases = (True, False, True)
         for is_prefill in phases:
             scheduled_seqs = self._schedule_prefill() if is_prefill else self._schedule_decode()
             if scheduled_seqs:
+                # Count successful batches only, including partial prefills.
+                if fairness_enabled:
+                    if is_prefill:
+                        self.consecutive_decode_steps = 0
+                    else:
+                        self.consecutive_decode_steps += 1
                 return scheduled_seqs, is_prefill
 
         # Pending work must not be reported as an empty successful batch: the
@@ -50,11 +62,13 @@ class Scheduler:
         scheduled_seqs = []
         num_batched_tokens = 0
 
-        while self.waiting and len(scheduled_seqs) < self.max_num_seqs:
+        while self.waiting and len(scheduled_seqs) < self.max_num_seqs: #只要 waiting 非空，且没有达到请求数量上限，就尝试处理队首请求
             seq = self.waiting[0]
+            #1.检查 Token 预算
             remaining = self.max_num_batched_tokens - num_batched_tokens
             if remaining == 0:
                 break
+            #2.检查 KV Cache 是否足够
             if not seq.block_table:
                 num_cached_blocks = self.block_manager.can_allocate(seq)
                 if num_cached_blocks == -1:

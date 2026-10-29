@@ -421,5 +421,208 @@ class SchedulingPolicyTests(SchedulerTestCase):
                 self.assert_blocks_consistent(scheduler)
 
 
+class DecodeFairnessTests(SchedulerTestCase):
+    def make_fair_scheduler(self, **kwargs):
+        options = dict(scheduling_policy="decode_first", max_consecutive_decode_steps=2)
+        options.update(kwargs)
+        return self.make_scheduler(**options)
+
+    def step(self, scheduler, expected_seqs, is_prefill, expected_count):
+        seqs, actual_prefill = scheduler.schedule()
+        self.assertEqual(seqs, expected_seqs)
+        self.assertEqual(actual_prefill, is_prefill)
+        self.assertEqual(scheduler.consecutive_decode_steps, expected_count)
+        self.assert_blocks_consistent(scheduler)
+        scheduler.postprocess(seqs, [17] * len(seqs), actual_prefill)
+        # postprocess must not count the same batch a second time.
+        self.assertEqual(scheduler.consecutive_decode_steps, expected_count)
+        self.assert_blocks_consistent(scheduler)
+
+    def test_default_zero_and_valid_thresholds(self):
+        self.assertEqual(self.make_config().max_consecutive_decode_steps, 0)
+        for threshold in (0, 1, 2, 100):
+            with self.subTest(threshold=threshold):
+                config = self.make_config(max_consecutive_decode_steps=threshold)
+                self.assertEqual(config.max_consecutive_decode_steps, threshold)
+
+    def test_invalid_thresholds_raise_value_error(self):
+        for threshold in (-1, -100, 0.0, 2.0, 1.5, True, False, None, "2", []):
+            with self.subTest(threshold=threshold):
+                with self.assertRaisesRegex(ValueError, "max_consecutive_decode_steps"):
+                    self.make_config(max_consecutive_decode_steps=threshold)
+
+    def test_zero_threshold_preserves_stage_one_execution_order(self):
+        for policy in ("prefill_first", "decode_first"):
+            with self.subTest(policy=policy):
+                scheduler = self.make_fair_scheduler(
+                    scheduling_policy=policy, max_consecutive_decode_steps=0)
+                first = self.make_seq(max_tokens=5)
+                second = self.make_seq(token=2, max_tokens=2)
+                scheduler.add(first)
+                self.step(scheduler, [first], True, 0)
+                scheduler.add(second)
+                trace = self.finish_all(scheduler, [first, second])
+                if policy == "decode_first":
+                    expected = [(False, (first.seq_id,))] * 4 + [
+                        (True, (second.seq_id,)), (False, (second.seq_id,))]
+                else:
+                    expected = [(True, (second.seq_id,)),
+                                (False, (first.seq_id, second.seq_id))] + [
+                                    (False, (first.seq_id,))] * 3
+                self.assertEqual(trace, expected)
+                self.assertEqual(scheduler.consecutive_decode_steps, 0)
+
+    def test_two_decode_batches_then_prefill_and_counter_reset(self):
+        scheduler = self.make_fair_scheduler()
+        first = self.make_seq(max_tokens=8)
+        second = self.make_seq(token=2, max_tokens=4)
+        third = self.make_seq(token=3)
+        scheduler.add(first)
+        self.step(scheduler, [first], True, 0)
+        scheduler.add(second)
+        self.step(scheduler, [first], False, 1)
+        self.step(scheduler, [first], False, 2)
+        self.assertEqual(list(scheduler.waiting), [second])
+        self.step(scheduler, [second], True, 0)
+        scheduler.add(third)
+        # A decode batch containing two requests still counts as one round.
+        self.step(scheduler, [first, second], False, 1)
+        self.step(scheduler, [first, second], False, 2)
+        self.step(scheduler, [third], True, 0)
+        self.finish_all(scheduler, [first, second, third])
+
+    def test_empty_waiting_allows_decode_beyond_threshold_and_idle_keeps_count(self):
+        scheduler = self.make_fair_scheduler()
+        seq = self.make_seq(max_tokens=5)
+        scheduler.add(seq)
+        self.step(scheduler, [seq], True, 0)
+        for count in range(1, 5):
+            self.assertFalse(scheduler.waiting)
+            self.step(scheduler, [seq], False, count)
+        self.assertTrue(scheduler.is_finished())
+        self.assertEqual(scheduler.schedule(), ([], False))
+        self.assertEqual(scheduler.consecutive_decode_steps, 4)
+        self.assert_blocks_consistent(scheduler, seq)
+        new_seq = self.make_seq(token=2)
+        scheduler.add(new_seq)
+        self.step(scheduler, [new_seq], True, 0)
+        self.finish_all(scheduler, [new_seq])
+
+    def test_blocked_prefill_falls_back_to_decode_without_reset(self):
+        scheduler = self.make_fair_scheduler(num_kvcache_blocks=1)
+        first = self.make_seq(max_tokens=5)
+        second = self.make_seq(token=2)
+        scheduler.add(first)
+        self.step(scheduler, [first], True, 0)
+        scheduler.add(second)
+        for count in range(1, 5):
+            self.step(scheduler, [first], False, count)
+            self.assertEqual(list(scheduler.waiting), [second])
+            self.assertEqual(second.block_table, [])
+        self.assert_blocks_consistent(scheduler, first)
+        self.step(scheduler, [second], True, 0)
+        self.finish_all(scheduler, [first, second])
+
+    def test_prefill_first_ignores_positive_threshold(self):
+        scheduler = self.make_fair_scheduler(scheduling_policy="prefill_first")
+        first = self.make_seq(max_tokens=6)
+        second = self.make_seq(token=2)
+        scheduler.add(first)
+        self.step(scheduler, [first], True, 0)
+        self.step(scheduler, [first], False, 0)
+        scheduler.add(second)
+        self.step(scheduler, [second], True, 0)
+        self.finish_all(scheduler, [first, second])
+        self.assertEqual(scheduler.consecutive_decode_steps, 0)
+
+    def test_each_successful_chunk_resets_counter_before_prefill_finishes(self):
+        scheduler = self.make_fair_scheduler(max_num_batched_tokens=128)
+        first = self.make_seq(max_tokens=12)
+        chunked = self.make_seq(length=300, token=2)
+        scheduler.add(first)
+        self.step(scheduler, [first], True, 0)
+        scheduler.add(chunked)
+        for cached in (128, 256, 300):
+            self.step(scheduler, [first], False, 1)
+            self.step(scheduler, [first], False, 2)
+            self.step(scheduler, [chunked], True, 0)
+            self.assertEqual(chunked.num_cached_tokens, cached)
+            if cached < 300:
+                self.assertEqual(list(scheduler.waiting), [chunked])
+                self.assertEqual(chunked.num_completion_tokens, 0)
+            else:
+                self.assertEqual(list(scheduler.waiting), [])
+                self.assertEqual(chunked.num_completion_tokens, 1)
+        self.finish_all(scheduler, [first, chunked])
+
+    def test_preemption_preserves_requests_and_all_blocks_are_released(self):
+        scheduler = self.make_fair_scheduler(num_kvcache_blocks=2)
+        first = self.make_seq(length=256, max_tokens=5)
+        second = self.make_seq(length=256, token=2, max_tokens=3)
+        scheduler.add(first)
+        scheduler.add(second)
+        self.step(scheduler, [first, second], True, 0)
+        self.step(scheduler, [first], False, 1)
+        self.assertEqual(list(scheduler.waiting), [second])
+        self.assertEqual(second.completion_token_ids, [17])
+        self.assertEqual(second.block_table, [])
+        self.assertEqual(second.num_cached_tokens, 0)
+        self.assertTrue(second.is_prefill)
+        # Forced prefill cannot fit second's two blocks until first finishes.
+        for count in (2, 3, 4):
+            self.step(scheduler, [first], False, count)
+        self.assert_blocks_consistent(scheduler, first)
+        self.step(scheduler, [second], True, 0)
+        self.assertEqual(second.completion_token_ids, [17, 17])
+        self.finish_all(scheduler, [first, second])
+
+    def test_forced_prefill_shares_prefix_and_preserves_reference_counts(self):
+        scheduler = self.make_fair_scheduler(num_kvcache_blocks=3)
+        first = self.make_seq(length=300, max_tokens=5)
+        second = self.make_seq(length=300, max_tokens=3)
+        scheduler.add(first)
+        self.step(scheduler, [first], True, 0)
+        prefix_block = first.block_table[0]
+        scheduler.add(second)
+        self.step(scheduler, [first], False, 1)
+        self.step(scheduler, [first], False, 2)
+        seqs, is_prefill = scheduler.schedule()
+        self.assertEqual(seqs, [second])
+        self.assertTrue(is_prefill)
+        self.assertEqual(scheduler.consecutive_decode_steps, 0)
+        self.assertEqual(second.num_cached_tokens, 256)
+        self.assertEqual(second.num_scheduled_tokens, 44)
+        self.assertEqual(second.block_table[0], prefix_block)
+        self.assertEqual(scheduler.block_manager.blocks[prefix_block].ref_count, 2)
+        self.assert_blocks_consistent(scheduler)
+        scheduler.postprocess(seqs, [17], is_prefill)
+        self.step(scheduler, [first, second], False, 1)
+        self.step(scheduler, [first, second], False, 2)
+        self.assert_blocks_consistent(scheduler, first, second)
+        self.assertTrue(scheduler.is_finished())
+
+    def test_failed_scheduling_preserves_existing_counter(self):
+        scheduler = self.make_fair_scheduler(num_kvcache_blocks=1)
+        # Prefill produces token 255, then two decodes produce tokens 256/257.
+        seq = self.make_seq(length=254, max_tokens=6)
+        scheduler.add(seq)
+        self.step(scheduler, [seq], True, 0)
+        self.step(scheduler, [seq], False, 1)
+        self.step(scheduler, [seq], False, 2)
+        with self.assertRaisesRegex(RuntimeError, "Cannot schedule any request"):
+            scheduler.schedule()
+        self.assertEqual(scheduler.consecutive_decode_steps, 2)
+        self.assertEqual(list(scheduler.waiting), [seq])
+        self.assertEqual(list(scheduler.running), [])
+        self.assertEqual(seq.num_completion_tokens, 3)
+        self.assertEqual(seq.block_table, [])
+        self.assert_blocks_consistent(scheduler)
+        # Retrying the blocked prefill must also leave the counter unchanged.
+        with self.assertRaisesRegex(RuntimeError, "Cannot schedule any request"):
+            scheduler.schedule()
+        self.assertEqual(scheduler.consecutive_decode_steps, 2)
+        self.assert_blocks_consistent(scheduler)
+
+
 if __name__ == "__main__":
     unittest.main()

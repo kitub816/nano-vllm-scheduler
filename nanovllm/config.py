@@ -18,10 +18,16 @@ class Config:
     kvcache_block_size: int = 256
     num_kvcache_blocks: int = -1
     scheduling_policy: str = "prefill_first"
+    max_consecutive_decode_steps: int = 0
 
     def __post_init__(self):
         if self.scheduling_policy not in ("prefill_first", "decode_first"):
             raise ValueError(f"Unsupported scheduling policy: {self.scheduling_policy!r}")
+        if type(self.max_consecutive_decode_steps) is not int or self.max_consecutive_decode_steps < 0:
+            raise ValueError(
+                "max_consecutive_decode_steps must be a non-negative integer, "
+                f"got {self.max_consecutive_decode_steps!r}"
+            )
         assert os.path.isdir(self.model)
         assert self.kvcache_block_size % 256 == 0
         assert 1 <= self.tensor_parallel_size <= 8
