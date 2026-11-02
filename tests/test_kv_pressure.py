@@ -181,8 +181,48 @@ class PressureTests(SchedulerTestCase):
         self.assertEqual(stats["reserve_wait_total_s"], 0)
         self.assertIsNone(stats["reserve_wait_p95_s"])
 
+    def test_actual_bypass_events_match_allocations_and_reject_duplicates(self):
+        scheduler = self.make_scheduler(num_kvcache_blocks=4, max_num_seqs=4,
+            kv_admission_policy="reserve", kv_reserve_blocks=2, kv_bounded_bypass=True,
+            decode_queue_policy="round_robin")
+        specs = [RequestSpec(i, [i+1]*length, 4, 0., "bypass_metric_test")
+                 for i, length in enumerate((8, 504, 8, 8))]
+        engine = CpuEngine(scheduler)
+        observer = PressureObserver(engine, specs)
+        with observer:
+            elapsed = run_requests(engine, observer, specs,
+                lambda n: SamplingParams(max_tokens=n, ignore_eos=True), 10, 100, 10)
+        self.assertEqual(len(observer.bypass_events), 1)
+        event = observer.bypass_events[0]
+        self.assertEqual((event["head_request_id"], event["candidate_request_id"]), (1, 2))
+        resources = resource_snapshot(scheduler)
+        resources.update(released=True, block_ref_count_sum=0)
+        run = dict(summary=dict(**pressure_identity("B8_bypass", 0), **pressure_summary(observer, elapsed),
+                                status="ok", num_kvcache_blocks=4, torch_compile_frames_during_measurement=0),
+                   requests=[{**r.to_dict(), **observer.request_stats[r.request_id]}
+                             for r in observer.records.values()],
+                   steps=observer.steps, resource_check=resources, environment=dict(physical_blocks=4),
+                   preemption_events=observer.preemption_events, allocation_events=observer.allocation_events,
+                   reserve_deferral_events=observer.reserve_deferral_events,
+                   reserve_wait_events=observer.reserve_wait_events, bypass_events=observer.bypass_events)
+        self.assertTrue(validate_pressure_run(run, specs))
+        altered = deepcopy(run)
+        altered["bypass_events"].append(deepcopy(event))
+        altered["summary"]["actual_bypasses"] = 2
+        with self.assertRaisesRegex(ValueError, "bypass"):
+            validate_pressure_run(altered, specs)
+
 
 class WorkloadTests(unittest.TestCase):
+    def test_bypass_label_is_only_independent_switch(self):
+        fifo = pressure_identity("B8", 0)
+        bypass = pressure_identity("B8_bypass", 0)
+        self.assertFalse(fifo.pop("kv_bounded_bypass"))
+        self.assertTrue(bypass.pop("kv_bounded_bypass"))
+        fifo.pop("policy")
+        bypass.pop("policy")
+        self.assertEqual(fifo, bypass)
+
     def test_admission_labels_preserve_rr_and_explicit_configuration(self):
         for label, reserve in (("B0", 0), ("B4", 4), ("B8", 8), ("B16", 16)):
             config = pressure_identity(label, 2)

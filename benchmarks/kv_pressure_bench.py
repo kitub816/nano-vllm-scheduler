@@ -30,7 +30,7 @@ from benchmarks.reliability import (interval_analysis, validate_run_steps, write
 
 
 POLICIES = ("prefill_first", "prefill_first_rr", "decode_first_fair2_rr")
-ADMISSION_RESERVES = {"B0": 0, "B4": 4, "B8": 8, "B16": 16}
+ADMISSION_RESERVES = {"B0": 0, "B4": 4, "B8": 8, "B16": 16, "B8_bypass": 8}
 PRESSURES = {"low": 16, "medium": 48, "high": 80}
 
 
@@ -38,7 +38,8 @@ def pressure_identity(policy, repeat):
     base = "prefill_first_rr" if policy in ADMISSION_RESERVES else policy
     return dict(**{**run_identity(base, repeat), "policy": policy},
                 kv_admission_policy="reserve" if policy in ADMISSION_RESERVES else "none",
-                kv_reserve_blocks=ADMISSION_RESERVES.get(policy, 0))
+                kv_reserve_blocks=ADMISSION_RESERVES.get(policy, 0),
+                kv_bounded_bypass=policy == "B8_bypass")
 
 
 def make_workload(tokenizer, count, seed):
@@ -131,6 +132,7 @@ class PressureObserver(EngineObserver):
         self.reserve_deferral_events = []
         self.reserve_wait_events = []
         self.pending_reserve_waits = {}
+        self.bypass_events = []
 
     def request_id(self, seq):
         return self.sequences[seq.seq_id].request_id
@@ -146,6 +148,25 @@ class PressureObserver(EngineObserver):
         original_append = manager.can_append
         original_preempt, original_schedule = scheduler.preempt, scheduler.schedule
         original_postprocess = scheduler.postprocess
+        original_promote = scheduler._promote_bypass
+
+        def promote(head, candidate):
+            waiting_before = [self.request_id(seq) for seq in scheduler.waiting]
+            allocation = self.allocation_events[-1]
+            if (scheduler.waiting[0] is not head or scheduler.waiting[1] is not candidate
+                    or head.block_table or head.num_completion_tokens or candidate.num_completion_tokens
+                    or head.seq_id in scheduler._bypassed_before_admission
+                    or allocation["request_id"] != self.request_id(candidate) or allocation["recovery"]):
+                raise RuntimeError("invalid bounded bypass state")
+            result = original_promote(head, candidate)
+            self.bypass_events.append(dict(event_index=len(self.bypass_events),
+                step_index=len(self.steps), time=self.now(), head_request_id=self.request_id(head),
+                candidate_request_id=self.request_id(candidate), waiting_before=waiting_before,
+                waiting_after=[self.request_id(seq) for seq in scheduler.waiting],
+                allocation_event_index=allocation["event_index"],
+                candidate_physical_blocks=len(candidate.block_table)-allocation["active_shared_blocks"],
+                free_after=len(manager.free_block_ids), reserve_blocks=scheduler.kv_reserve_blocks))
+            return result
 
         def new_block():
             block = manager.blocks[manager.free_block_ids[0]]
@@ -259,7 +280,8 @@ class PressureObserver(EngineObserver):
 
         for obj, name, method in ((manager, "_allocate_block", new_block), (manager, "allocate", allocate),
                                  (manager, "can_append", can_append), (scheduler, "preempt", preempt),
-                                 (scheduler, "schedule", schedule), (scheduler, "postprocess", postprocess)):
+                                 (scheduler, "schedule", schedule), (scheduler, "postprocess", postprocess),
+                                 (scheduler, "_promote_bypass", promote)):
             self.replace(obj, name, method)
         original_admit = scheduler._can_admit_prefill
         def can_admit(seq, cached_blocks):
@@ -342,7 +364,9 @@ def pressure_summary(observer, elapsed):
         reserve_wait_total_s=sum(waits), reserve_wait_p50_s=percentile(waits, .5),
         reserve_wait_p95_s=percentile(waits, .95),
         admission_to_first_prefill_p50_s=percentile(first_prefill_waits, .5),
+        admission_to_first_prefill_mean_s=sum(first_prefill_waits) / len(first_prefill_waits) if first_prefill_waits else None,
         admission_to_first_prefill_p95_s=percentile(first_prefill_waits, .95),
+        actual_bypasses=len(observer.bypass_events),
         decode_mean_batch_size=decode_batch_statistics(observer.steps)["mean_batch_size"])
 
 
@@ -384,7 +408,8 @@ def run_worker(manifest_path, output, pressure, policy, repeat):
                      gpu_memory_utilization=.65, scheduling_policy=identity["scheduling_policy"],
                      max_consecutive_decode_steps=identity["max_consecutive_decode_steps"],
                      decode_queue_policy=identity["decode_queue_policy"],
-                     kv_admission_policy=identity["kv_admission_policy"], kv_reserve_blocks=identity["kv_reserve_blocks"])
+                     kv_admission_policy=identity["kv_admission_policy"], kv_reserve_blocks=identity["kv_reserve_blocks"],
+                     kv_bounded_bypass=identity["kv_bounded_bypass"])
         def close():
             atexit.unregister(engine.exit)
             engine.exit()
@@ -441,7 +466,8 @@ def run_worker(manifest_path, output, pressure, policy, repeat):
         run.update(steps=observer.steps, preemption_events=observer.preemption_events,
                    allocation_events=observer.allocation_events,
                    reserve_deferral_events=observer.reserve_deferral_events,
-                   reserve_wait_events=observer.reserve_wait_events)
+                   reserve_wait_events=observer.reserve_wait_events,
+                   bypass_events=observer.bypass_events)
         if resources:
             resources.update(released=not resources["used_blocks"] and not resources["waiting_requests"]
                                       and not resources["running_requests"],
@@ -552,6 +578,30 @@ def validate_pressure_run(run, specs):
                 or summary["reserve_deferred_requests"] != len(attempts)
                 or summary["reserve_wait_total_s"] != sum(e["duration_s"] for e in run["reserve_wait_events"])):
             raise ValueError("reserve summary differs")
+    if "bypass_events" in run:
+        heads = set()
+        records = {r["request_id"]: r for r in run["requests"]}
+        for event in run["bypass_events"]:
+            head, candidate = event["head_request_id"], event["candidate_request_id"]
+            step = run["steps"][event["step_index"]]
+            allocation = run["allocation_events"][event["allocation_event_index"]]
+            rejected = [e for e in run["reserve_deferral_events"]
+                        if e["request_id"] == head and e["step_index"] == event["step_index"]
+                        and e["time"] <= event["time"]]
+            if (not summary.get("kv_bounded_bypass") or head in heads
+                    or event["waiting_before"][:2] != [head, candidate]
+                    or event["waiting_after"] != [candidate, head] + event["waiting_before"][2:]
+                    or step["phase"] != "prefill" or candidate not in step["request_ids"]
+                    or allocation["request_id"] != candidate or allocation["recovery"]
+                    or allocation["step_index"] != event["step_index"] or not rejected
+                    or event["candidate_physical_blocks"] != len(allocation["block_table"])-allocation["active_shared_blocks"]
+                    or event["free_after"] < event["reserve_blocks"]
+                    or not allocation["time"] <= event["time"] <= step["schedule_time"]
+                    or records[head]["first_prefill_time"] <= event["time"]):
+                raise ValueError("invalid or repeated bounded bypass event")
+            heads.add(head)
+        if summary["actual_bypasses"] != len(run["bypass_events"]):
+            raise ValueError("bypass summary differs")
     return True
 
 
@@ -630,6 +680,8 @@ def verify_results(directory):
             {**{k: r["summary"][k] for k in identities}, **row}
             for r in selected for row in r["requests"]])
         extra_fields = ("reserve_deferral_events", "reserve_wait_events") if any("reserve_deferral_events" in r for r in selected) else ()
+        if any("bypass_events" in r for r in selected):
+            extra_fields += ("bypass_events",)
         for field in ("steps", "preemption_events", "allocation_events") + extra_fields:
             expected_rows = [{"policy": r["summary"]["policy"], "repeat": r["summary"]["repeat"], **row}
                              for r in selected for row in r[field]]
@@ -656,6 +708,8 @@ def collect_results(directory, manifest, runs):
         subdir = directory / level
         write_results(subdir, selected, dict(config=manifest["config"], pressure=level))
         extra_fields = ("reserve_deferral_events", "reserve_wait_events") if any("reserve_deferral_events" in r for r in selected) else ()
+        if any("bypass_events" in r for r in selected):
+            extra_fields += ("bypass_events",)
         for field in ("steps", "preemption_events", "allocation_events") + extra_fields:
             export_csv(subdir / f"{field}.csv", [{"policy": r["summary"]["policy"],
                 "repeat": r["summary"]["repeat"], **row} for r in selected for row in r[field]])

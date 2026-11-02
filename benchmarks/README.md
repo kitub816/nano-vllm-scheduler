@@ -323,3 +323,49 @@ FIFO/容量等待，不能称为reserve的纯边际延迟；sum可重叠，不�
 （首次分配前等待+首次分配至首Token+首Token至完成），以检查等待是否转移。
 详见[kv_admission_analysis_zh.md](kv_admission_analysis_zh.md)。保持none默认，不自动
 加入动态余量、成本模型或其他调度优化。
+
+## 第六阶段第三步：FIFO队首阻塞离线复核
+
+```bash
+.venv/bin/python -m benchmarks.fifo_hol_analysis \
+  --results results_kv_admission_20261102 --output-dir results_fifo_hol_final_20261102
+.venv/bin/python -m benchmarks.fifo_hol_analysis \
+  --report-from results_fifo_hol_final_20261102/analysis.json
+```
+
+只读已有54组结果，不启动GPU、不改Scheduler/BlockManager/ModelRunner。输入目录
+逐文件SHA256前后核对，归档源码hash必须匹配；输出目录须独立且为空。重放实际
+入队、分配、完整/部分Prefill、抢占和完成操作，核对日志点waiting顺序与所有队列计数。
+额外检查Prefill-first步开始的真实free与队首，避免漏掉先在can_allocate失败的阻塞。
+
+比较FIFO、最多跳1位、最多跳2位、最小新增Block需求。每个模拟是从真实状态出发的
+**独立单次接纳分支**，不串接原未来完成/释放时间。候选前缀不能由已知Token证明
+无命中时标UNKNOWN，不能凭空假定缓存为空。活跃共享不消耗新free，空闲命中仍消耗free。
+
+结果中的机会次数与候选数分开，保留各请求实际首次等待、长等待阈值1/5秒与实际利用率。
+缺失生成Token IDs/完整KV变更/替代GPU服务时间，因此完整闭环模拟等待P95、饥饿次数、
+TTFT/完成延迟和时间利用率不可识别，明确为空。详细结论与数据缺口见
+[fifo_hol_analysis_zh.md](fifo_hol_analysis_zh.md)。
+
+## 第六阶段第四步：默认关闭的Bounded Bypass候选
+
+Config增加严格bool开关`kv_bounded_bypass=False`。仅在队首通过物理容量/Token预算检查、
+但被reserve拒绝时检查waiting第二项；两项均须为未接纳、未持块、非抢占恢复请求。
+候选仍满足真实容量、reserve、Token和批次数限制。成功分配后才调整顺序；每个未接纳
+队首终身最多被越过一次，开始的Chunked Prefill保持优先完成。原RR/fair2/抢占路径不变。
+
+```bash
+.venv/bin/python -m unittest discover -s tests -v
+.venv/bin/python -m benchmarks.kv_pressure_bench \
+  --workload-from results_kv_admission_20261102/manifest.json \
+  --expected-blocks 105 --pressures high --policies B8 B8_bypass \
+  --repeats 3 --output-dir results_kv_bypass_20261102
+.venv/bin/python -m benchmarks.kv_bypass_analysis --results results_kv_bypass_20261102
+.venv/bin/python -m benchmarks.kv_bypass_analysis --results results_kv_bypass_20261102 --verify
+```
+
+两个配置只有开关不同，B8_bypass仍为Prefill-first+RR+reserve8。独立进程、相同暖机、
+原80请求Token IDs、轮换顺序；输出必须使用新目录。新增bypass_events.csv记录真实成功
+越过，而非局部机会探针。分析保留每次结果、均值/样本SD/min/max、大小请求等待和逐请求
+配对，核验全部完成及Block引用归零。实测局部请求受益但整体尾延迟/大请求等待变差，
+保持默认关闭；完整数据和限制见[kv_bypass_analysis_zh.md](kv_bypass_analysis_zh.md)。

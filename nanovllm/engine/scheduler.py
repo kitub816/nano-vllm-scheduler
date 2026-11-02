@@ -14,6 +14,8 @@ class Scheduler:
         self.decode_queue_policy = config.decode_queue_policy
         self.kv_admission_policy = config.kv_admission_policy
         self.kv_reserve_blocks = config.kv_reserve_blocks
+        self.kv_bounded_bypass = config.kv_bounded_bypass
+        self._bypassed_before_admission: set[int] = set()
         self.max_consecutive_decode_steps = config.max_consecutive_decode_steps
         self.consecutive_decode_steps = 0
         self.eos = config.eos
@@ -78,6 +80,31 @@ class Scheduler:
                 physical_blocks -= 1
         return len(manager.free_block_ids) - physical_blocks >= self.kv_reserve_blocks
 
+    def _bypass_candidate(self, head: Sequence, remaining: int, has_scheduled: bool):
+        # Called only after a physically feasible head fails the reserve guard.
+        # Recovery/held chunks are never reordered, on either side of the pair.
+        if (not self.kv_bounded_bypass or len(self.waiting) < 2
+                or head.block_table or head.num_completion_tokens
+                or head.seq_id in self._bypassed_before_admission):
+            return None
+        candidate = self.waiting[1]
+        if candidate.block_table or candidate.num_completion_tokens:
+            return None
+        cached = self.block_manager.can_allocate(candidate)
+        if cached == -1:
+            return None
+        tokens = candidate.num_tokens - cached * self.block_size
+        if (has_scheduled and tokens > remaining) or not self._can_admit_prefill(candidate, cached):
+            return None
+        return candidate, cached, tokens
+
+    def _promote_bypass(self, head: Sequence, candidate: Sequence):
+        # Commit only after allocation succeeds. A partial candidate becomes the
+        # held head until its chunks finish; the original head retains its debt.
+        self.waiting.remove(candidate)
+        self.waiting.appendleft(candidate)
+        self._bypassed_before_admission.add(head.seq_id)
+
     def _schedule_prefill(self) -> list[Sequence]:  #负责 waiting 队列中的请求，返回本轮选择执行的请求列表
         scheduled_seqs = []
         num_batched_tokens = 0
@@ -99,9 +126,17 @@ class Scheduler:
             if remaining < num_tokens and scheduled_seqs:  # only allow chunked prefill for the first seq
                 break
             if not seq.block_table:
+                bypassed_head = None
                 if not self._can_admit_prefill(seq, num_cached_blocks):
-                    break
+                    candidate = self._bypass_candidate(seq, remaining, bool(scheduled_seqs))
+                    if candidate is None:
+                        break
+                    bypassed_head = seq
+                    seq, num_cached_blocks, num_tokens = candidate
                 self.block_manager.allocate(seq, num_cached_blocks)
+                self._bypassed_before_admission.discard(seq.seq_id)
+                if bypassed_head is not None:
+                    self._promote_bypass(bypassed_head, seq)
             seq.num_scheduled_tokens = min(num_tokens, remaining)
             num_batched_tokens += seq.num_scheduled_tokens
             if seq.num_cached_tokens + seq.num_scheduled_tokens == seq.num_tokens:

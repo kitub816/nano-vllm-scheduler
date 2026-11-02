@@ -22,8 +22,11 @@ class Config:
     decode_queue_policy: str = "head_first"
     kv_admission_policy: str = "none"
     kv_reserve_blocks: int = 0
+    kv_bounded_bypass: bool = False
 
     def __post_init__(self):
+        if type(self.kv_bounded_bypass) is not bool:
+            raise ValueError(f"kv_bounded_bypass must be a boolean, got {self.kv_bounded_bypass!r}")
         if self.kv_admission_policy not in ("none", "reserve"):
             raise ValueError(f"Unsupported kv_admission_policy: {self.kv_admission_policy!r}")
         if type(self.kv_reserve_blocks) is not int or self.kv_reserve_blocks < 0:
