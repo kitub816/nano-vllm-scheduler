@@ -241,3 +241,48 @@ cost_models.json。还有只使用训练进程的留一进程交叉验证，避�
 实测解释及限制见 [prefill_timeline_analysis_zh.md](prefill_timeline_analysis_zh.md)。
 Profiler和Python范围标记会引入额外开销，trace中的空隙只能描述该次可见的活动，
 不能当作未插桩执行的GPU空闲率或据此宣称成本模型有效。
+
+## 第六阶段第一步：KV Cache 原生容量高压测试
+
+```bash
+.venv/bin/python -m benchmarks.kv_pressure_bench --output-dir results_kv_pressure
+.venv/bin/python -m benchmarks.kv_pressure_bench --verify results_kv_pressure
+.venv/bin/python -m unittest discover -s tests -v
+git diff --check
+```
+
+工具不限制或改写KV容量。原ModelRunner在初始化时按显存测量计算并分配完整KV池；
+工具核对实际张量、Runner配置和BlockManager的容量完全相等，并要求所有对比运行
+容量一致。`num_kvcache_blocks`输入会被原Runner覆盖，不能用于固定容量；本工具
+不采用修改free_block_ids的方式制造压力，也不修改Scheduler/ModelRunner源码。
+
+默认低/中/高档为16/48/80个同时到达的请求；同一seed生成同一80请求序列，各档
+取前缀，同一档各策略使用完全相同的Prompt Token IDs。Prompt交替248/504 Token，
+输出16 Token，跨越256 Token页边界；请求1/3有一个刻意共享的完整256 Token前缀。
+每个请求独立完成最多需要2或3块，运行前检查其资源和上下文约束。
+压力标签是施加的负载等级，是否发生抢占由实际调度和占用决定。
+
+比较prefill_first/head_first、prefill_first/round_robin、decode_first/fair2/round_robin。
+默认3次重复，27个独立进程；每组两轮相同暖机，轮换策略与压力等级顺序。
+引擎参数为TP=1、eager=True、max_model_len=768、Token预算256、max_num_seqs=4、
+显存比例0.65。暖机后仅清除空闲Block的Prefix索引/Token元数据，保持真实容量、
+free列表和引用计数不变，防止暖机Prefix命中影响正式负载。
+
+沿用EngineObserver在真实append_token之后记录时间、完成后记录完成时间，
+导出TTFT/ITL/吞吐等原指标，并增加逐请求抢占、实际重算、成功分配时的Prefix
+复用、缓存覆盖和峰值占用。重算量只计算抢占后本轮执行区间与历史有效KV前缀的
+交集，普通Prefill和尚未计算过的输出Token不计入。恢复时Prefix命中避开了哪些
+Token计算也单独保存；只计算成功allocate命中，不把can_allocate探测重复累计。
+
+recompute_affected_step_wall_s包含混合批次中的新计算、调度与同步；
+recompute_only_step_wall_s仅汇总整批Token都属于重算的轮次，两者都不等于反事实
+的边际延迟。marginal_preemption_overhead_s保留为空，不按Token比例摊分耗时。
+step_weighted_block_utilization按每步调度后占用乘整步耗时加权，是采样近似，
+不是逐次分配/释放事件积分得到的精确时间占用率。
+
+结果保存于Git忽略的results_kv_pressure：manifest及源码快照、runs逐进程JSON和
+日志、总summary.csv、pressure_runs.json、cross_run_statistics.csv；各压力子目录
+包含summary.csv/JSON、raw_requests.csv、steps.csv、preemption_events.csv、
+allocation_events.csv。异常保留日志/部分结果并报错，不计入成功性能统计。
+超时、总步数与无新输出/新KV进度限制分别由--timeout-seconds、--max-steps、
+--no-progress-steps控制。分析见[kv_pressure_analysis_zh.md](kv_pressure_analysis_zh.md)。
