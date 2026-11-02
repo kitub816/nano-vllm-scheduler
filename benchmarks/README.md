@@ -176,3 +176,68 @@ summary 和请求 CSV。实验和暖机复用第三阶段实现，结果目录�
 `queue_run_metrics.csv`、`queue_cross_run_statistics.csv` 和 `queue_analysis.json`
 保存逐次与跨运行指标。源码核心 Diff 另存本地结果目录的 `source.diff`。
 4 组但只有 3 次重复时，简单 rotate 不能完全平衡 4 个执行位置，报告会保留这一限制。
+
+## 第五阶段第一步：Prefill 成本 Profiling
+
+```bash
+.venv/bin/python -m benchmarks.prefill_profile --output-dir results_prefill_profile
+.venv/bin/python -m benchmarks.prefill_profile --verify-only results_prefill_profile
+```
+
+独立工具覆盖 q=16/32/64/128/256、c=0/64/128/256、batch_size=1/2/4。
+q 为整轮实际执行的 Token 总数；同质批次每请求 q_i=q/batch_size，c 为每请求
+前缀长度，同时导出 q_each/c_each/c_total。默认每组合3次暖机、10次测量。
+max_model_len=1024，用于覆盖512个Prompt Token加一个输出Token；其余引擎模式为
+TP=1、eager=True、显存比例0.65。
+
+KV分配和真实前缀计算位于计时外：c>0 时调用原Runner执行前缀，再由原postprocess
+推进缓存进度；之后原Scheduler选择目标轮次，不修改调度算法。输出一个Token后
+立即完成请求，检查KV引用计数和释放。该微基准不等于完整在线请求延迟。
+
+step_wall_ms 是主机 engine.step 总时间；runner_wall_ms、prepare_wall_ms 和
+model_submit_wall_ms 提供主机侧分段。CUDA Event包围run_model的完整前向+logits，
+记录为cuda_model_stream_ms；它排除输入准备、采样与后处理，但可能包含提交间隙，
+不能称为纯活跃Kernel时间，也不能从主机总时间中相减得到纯CPU耗时。
+`--no-cuda-events` 可关闭Event，此时字段为空，不填造设备时间。
+
+结果写入Git忽略的本地目录：raw_prefill.csv、summary.csv、profile.json、
+manifest.json、runs/batch*.json和日志。报告为prefill_profile_analysis_zh.md，包含
+q×c关系表、每组合均值/P50/P95及测量限制；当前没有验证任何预测成本模型。
+`--q-values`、`--c-values`、`--batch-sizes`、`--warmup-rounds`、`--repeats`
+可控制小规模复现；上下文长度不满足或q无法均分的组合会明确列入skipped计划。
+
+## 第五阶段第二步：Timeline 与进程留出验证
+
+```bash
+.venv/bin/python -m benchmarks.prefill_timeline --output-dir results_prefill_timeline
+.venv/bin/python -m benchmarks.prefill_timeline --verify results_prefill_timeline
+.venv/bin/python -m unittest discover -s tests -v
+```
+
+默认使用第一步的 seed=0、相同真实 Token Prompt 与引擎参数，覆盖任务指定的7种
+组合。6个独立进程各组合5次暖机、15次正式采样；每轮随机组合顺序。事先固定偶数
+进程训练、奇数进程留出，按时间交替执行。最后另启1个进程采集 torch.profiler，
+不把 Profiler 数据输入预测模型。可用 `--processes`、`--repeats`、`--warmup-rounds`
+调整规模，`--profile-only` / `--measure-only` 分开运行，`--case-ids` 选择指定子集。
+每进程设超时，失败保留日志并报错；输出目录必须为空，以免覆盖已有结果。
+
+NVML通过标准库ctypes只读采集SM时钟、温度、功耗；不支持的字段保留为空并报告
+错误码。正式计时外采集前后快照，不是连续传感器采样。Step Wall与CUDA Event
+沿用第一步口径：Event是前向+logits的流时间跨度，包含主机提交造成的间隙，
+不等于活跃Kernel总耗时。
+
+`results_prefill_timeline/`（Git忽略）保存 manifest、源码快照、逐进程JSON/日志、
+raw_measurements.csv、process_summary.csv、case_summary.csv、timeline.json、
+timeline_summary.csv、逐组合CPU算子/Kernel/算子类别/流间隙CSV，以及
+traces/*.trace.json.gz。解压trace后可用现有Chrome Trace/Perfetto查看器查看。
+CUDA关联使用correlation ID，CPU与GPU镜像annotation分开处理，避免重复计数。
+
+`prefill_cost_model.py`仅使用标准库：A为训练样本中位数常数（适合MAE的基线），
+B为`intercept + slope*q/256`最小二乘模型；均在独立进程留出集评价。误差逐样本
+保存于holdout_predictions.csv，MAE/P95及误差分桶保存于holdout_metrics.csv和
+cost_models.json。还有只使用训练进程的留一进程交叉验证，避免训练集拟合冒充
+预测能力。当前7种组合中c与分页KV标记共线，不拟合无法区分这些因素的复杂模型。
+
+实测解释及限制见 [prefill_timeline_analysis_zh.md](prefill_timeline_analysis_zh.md)。
+Profiler和Python范围标记会引入额外开销，trace中的空隙只能描述该次可见的活动，
+不能当作未插桩执行的GPU空闲率或据此宣称成本模型有效。
