@@ -20,8 +20,14 @@ class Config:
     scheduling_policy: str = "prefill_first"
     max_consecutive_decode_steps: int = 0
     decode_queue_policy: str = "head_first"
+    kv_admission_policy: str = "none"
+    kv_reserve_blocks: int = 0
 
     def __post_init__(self):
+        if self.kv_admission_policy not in ("none", "reserve"):
+            raise ValueError(f"Unsupported kv_admission_policy: {self.kv_admission_policy!r}")
+        if type(self.kv_reserve_blocks) is not int or self.kv_reserve_blocks < 0:
+            raise ValueError(f"kv_reserve_blocks must be a non-negative integer, got {self.kv_reserve_blocks!r}")
         if self.scheduling_policy not in ("prefill_first", "decode_first"):
             raise ValueError(f"Unsupported scheduling policy: {self.scheduling_policy!r}")
         if self.decode_queue_policy not in ("head_first", "round_robin"):

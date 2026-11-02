@@ -5,7 +5,7 @@ import unittest
 
 from benchmarks.kv_pressure_bench import (PressureObserver, make_workload, resource_snapshot,
                                           validate_workload, run_requests, clear_idle_prefix_cache,
-                                          pressure_summary, validate_pressure_run)
+                                          pressure_summary, validate_pressure_run, pressure_identity)
 from benchmarks.mixed_load_bench import RequestSpec, run_identity
 from test_scheduler_policy import SchedulerTestCase, Sequence, SamplingParams
 
@@ -151,8 +151,46 @@ class PressureTests(SchedulerTestCase):
         self.assertNotIn("step", vars(engine))
         self.assertNotIn("is_finished", vars(engine))
 
+    def test_reserve_deferral_episode_closes_at_first_real_allocation(self):
+        scheduler = self.make_scheduler(num_kvcache_blocks=4, max_num_seqs=4,
+            kv_admission_policy="reserve", kv_reserve_blocks=3, decode_queue_policy="round_robin")
+        specs = [RequestSpec(i, [i+1]*8, 4, 0., "reserve_metric_test") for i in range(2)]
+        engine = CpuEngine(scheduler)
+        observer = PressureObserver(engine, specs)
+        with observer:
+            elapsed = run_requests(engine, observer, specs,
+                lambda n: SamplingParams(max_tokens=n, ignore_eos=True), 10, 100, 10)
+        stats = pressure_summary(observer, elapsed)
+        self.assertGreater(stats["reserve_deferrals"], 0)
+        self.assertEqual(stats["reserve_deferred_requests"], 1)
+        self.assertEqual(len(observer.reserve_wait_events), 1)
+        self.assertEqual(observer.pending_reserve_waits, {})
+        event = observer.reserve_wait_events[0]
+        self.assertEqual(event["request_id"], 1)
+        self.assertEqual(event["attempts"], len(observer.reserve_deferral_events))
+        self.assertEqual(event["duration_s"], event["end_time"] - event["start_time"])
+        self.assertEqual(event["end_time"], observer.request_stats[1]["first_prefill_time"])
+        self.assertEqual(event["duration_s"], observer.request_stats[1]["reserve_wait_s"])
+        self.assertEqual(resource_snapshot(scheduler)["free_blocks"], 4)
+
+    def test_zero_reserve_never_logs_false_deferrals(self):
+        _, observer, elapsed = self.execute(count=10, blocks=4)
+        stats = pressure_summary(observer, elapsed)
+        self.assertGreater(stats["preemptions"], 0)
+        self.assertEqual(stats["reserve_deferrals"], 0)
+        self.assertEqual(stats["reserve_wait_total_s"], 0)
+        self.assertIsNone(stats["reserve_wait_p95_s"])
+
 
 class WorkloadTests(unittest.TestCase):
+    def test_admission_labels_preserve_rr_and_explicit_configuration(self):
+        for label, reserve in (("B0", 0), ("B4", 4), ("B8", 8), ("B16", 16)):
+            config = pressure_identity(label, 2)
+            self.assertEqual((config["scheduling_policy"], config["decode_queue_policy"]),
+                             ("prefill_first", "round_robin"))
+            self.assertEqual((config["kv_admission_policy"], config["kv_reserve_blocks"]), ("reserve", reserve))
+            self.assertEqual(config["repeat"], 2)
+
     def test_seed_ids_lengths_and_shared_prefix(self):
         class Tokenizer:
             def encode(self, text, add_special_tokens=False):

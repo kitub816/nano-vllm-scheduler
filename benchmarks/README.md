@@ -286,3 +286,40 @@ step_weighted_block_utilization按每步调度后占用乘整步耗时加权，�
 allocation_events.csv。异常保留日志/部分结果并报错，不计入成功性能统计。
 超时、总步数与无新输出/新KV进度限制分别由--timeout-seconds、--max-steps、
 --no-progress-steps控制。分析见[kv_pressure_analysis_zh.md](kv_pressure_analysis_zh.md)。
+
+## 第六阶段第二步：KV首次接纳余量保护
+
+Config新增`kv_admission_policy="none"|"reserve"`（默认none）与
+`kv_reserve_blocks=0`（严格非负整数，拒绝bool/浮点数等）。none或reserve=0
+保持旧调度轨迹。reserve只在新请求首次分配前检查：
+
+`free_blocks - (seq.num_blocks - 活跃共享前缀块数) >= kv_reserve_blocks`
+
+空闲缓存命中仍消耗free槽位，不能减去全部Prefix命中块。该检查不修改BlockManager，
+也不是Prefix收益评分或缓存命中率优化。保留FIFO和原RR；已持块Chunked Prefill、
+抢占恢复和running为空的前进路径不被余量阻塞。Decode/恢复仍可用掉余量，
+所以它不保证全程free>=reserve，也不保证零抢占。物理容量不足仍明确报错。
+
+```bash
+.venv/bin/python -m benchmarks.kv_pressure_bench \
+  --workload-from results_kv_pressure/manifest.json --expected-blocks 105 \
+  --policies prefill_first B0 B4 B8 B16 decode_first_fair2_rr \
+  --repeats 3 --output-dir results_kv_admission_20261102
+.venv/bin/python -m benchmarks.kv_pressure_bench --verify results_kv_admission_20261102
+.venv/bin/python -m benchmarks.kv_admission_analysis --results results_kv_admission_20261102
+```
+
+原默认三策略仍可运行；B0/B4/B8/B16均为prefill_first+round_robin，余量分别0/4/8/16。
+A/C参考策略重新独立实测。精确复用上阶段Token工作负载，三压力×六配置×三重复，
+不覆盖原目录；物理容量不等于105时明确失败，不裁剪free列表。
+
+新结果保存策略配置、Config/Scheduler等源码快照，以及逐请求首次Block分配时间、
+reserve拒绝尝试数和episode等待时长。reserve_deferral_events.csv记录每次返回False；
+reserve_wait_events.csv将首次拒绝到首次实际分配合并一次。这个关联等待包含后续
+FIFO/容量等待，不能称为reserve的纯边际延迟；sum可重叠，不等于测试Wall Time。
+没有拒绝时P50/P95为空。原重算、Prefix、资源及逐Token指标继续核验。
+
+离线分析工具输出全部阈值、标准差/min/max、相对B0变化、请求平均延迟的可加分解
+（首次分配前等待+首次分配至首Token+首Token至完成），以检查等待是否转移。
+详见[kv_admission_analysis_zh.md](kv_admission_analysis_zh.md)。保持none默认，不自动
+加入动态余量、成本模型或其他调度优化。

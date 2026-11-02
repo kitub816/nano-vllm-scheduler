@@ -12,6 +12,8 @@ class Scheduler:
         self.max_num_batched_tokens = config.max_num_batched_tokens
         self.scheduling_policy = config.scheduling_policy
         self.decode_queue_policy = config.decode_queue_policy
+        self.kv_admission_policy = config.kv_admission_policy
+        self.kv_reserve_blocks = config.kv_reserve_blocks
         self.max_consecutive_decode_steps = config.max_consecutive_decode_steps
         self.consecutive_decode_steps = 0
         self.eos = config.eos
@@ -59,6 +61,23 @@ class Scheduler:
             f"max_num_batched_tokens={self.max_num_batched_tokens})"
         )
 
+    def _can_admit_prefill(self, seq: Sequence, num_cached_blocks: int) -> bool:
+        # Guard only a new allocation. Held chunks and preempted requests must
+        # finish/recover; when running is empty, admit work despite the reserve.
+        if (self.kv_admission_policy != "reserve" or self.kv_reserve_blocks == 0
+                or seq.block_table or seq.num_completion_tokens or not self.running):
+            return True
+        manager = self.block_manager
+        physical_blocks = seq.num_blocks
+        h = -1
+        for i in range(num_cached_blocks):
+            h = manager.compute_hash(seq.block(i), h)
+            # Active shared blocks cost no free slots. Free cached hits still
+            # leave the free list when reactivated and must not be subtracted.
+            if manager.hash_to_block_id[h] in manager.used_block_ids:
+                physical_blocks -= 1
+        return len(manager.free_block_ids) - physical_blocks >= self.kv_reserve_blocks
+
     def _schedule_prefill(self) -> list[Sequence]:  #负责 waiting 队列中的请求，返回本轮选择执行的请求列表
         scheduled_seqs = []
         num_batched_tokens = 0
@@ -80,6 +99,8 @@ class Scheduler:
             if remaining < num_tokens and scheduled_seqs:  # only allow chunked prefill for the first seq
                 break
             if not seq.block_table:
+                if not self._can_admit_prefill(seq, num_cached_blocks):
+                    break
                 self.block_manager.allocate(seq, num_cached_blocks)
             seq.num_scheduled_tokens = min(num_tokens, remaining)
             num_batched_tokens += seq.num_scheduled_tokens

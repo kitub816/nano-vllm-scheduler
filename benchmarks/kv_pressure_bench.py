@@ -30,7 +30,15 @@ from benchmarks.reliability import (interval_analysis, validate_run_steps, write
 
 
 POLICIES = ("prefill_first", "prefill_first_rr", "decode_first_fair2_rr")
+ADMISSION_RESERVES = {"B0": 0, "B4": 4, "B8": 8, "B16": 16}
 PRESSURES = {"low": 16, "medium": 48, "high": 80}
+
+
+def pressure_identity(policy, repeat):
+    base = "prefill_first_rr" if policy in ADMISSION_RESERVES else policy
+    return dict(**{**run_identity(base, repeat), "policy": policy},
+                kv_admission_policy="reserve" if policy in ADMISSION_RESERVES else "none",
+                kv_reserve_blocks=ADMISSION_RESERVES.get(policy, 0))
 
 
 def make_workload(tokenizer, count, seed):
@@ -111,7 +119,8 @@ class PressureObserver(EngineObserver):
         super().__init__(engine, specs, **kwargs)
         self.request_stats = {s.request_id: dict(preemptions=0, recomputed_tokens=0,
             prefill_tokens=0, prefix_hit_tokens=0, recovery_prefix_hit_tokens=0,
-            valid_highwater=0) for s in specs}
+            valid_highwater=0, reserve_deferrals=0, reserve_wait_s=0.,
+            first_prefill_time=None) for s in specs}
         self.preemption_events = []
         self.allocation_events = []
         self.peak_used_blocks = 0
@@ -119,6 +128,9 @@ class PressureObserver(EngineObserver):
         self.failed_can_append = 0
         self.blocked_request = None
         self.owner_sequences = {}
+        self.reserve_deferral_events = []
+        self.reserve_wait_events = []
+        self.pending_reserve_waits = {}
 
     def request_id(self, seq):
         return self.sequences[seq.seq_id].request_id
@@ -151,6 +163,14 @@ class PressureObserver(EngineObserver):
             recovery = self.request_stats[request_id]["preemptions"] > 0
             hit_tokens = hit_blocks * manager.block_size
             stats = self.request_stats[request_id]
+            if not recovery and stats["first_prefill_time"] is None:
+                stats["first_prefill_time"] = self.now()
+                if request_id in self.pending_reserve_waits:
+                    episode = self.pending_reserve_waits.pop(request_id)
+                    episode.update(end_time=stats["first_prefill_time"],
+                                   duration_s=stats["first_prefill_time"] - episode["start_time"])
+                    stats["reserve_wait_s"] = episode["duration_s"]
+                    self.reserve_wait_events.append(episode)
             stats["prefix_hit_tokens"] += hit_tokens
             stats["recovery_prefix_hit_tokens"] += hit_tokens if recovery else 0
             stats["valid_highwater"] = max(stats["valid_highwater"], seq.num_cached_tokens)
@@ -190,6 +210,8 @@ class PressureObserver(EngineObserver):
             return result
 
         def schedule():
+            if self.active_step is not None:
+                self.active_step["reserve_deferrals"] = 0
             seqs, is_prefill = original_schedule()
             executions = []
             for seq in seqs:
@@ -239,6 +261,28 @@ class PressureObserver(EngineObserver):
                                  (manager, "can_append", can_append), (scheduler, "preempt", preempt),
                                  (scheduler, "schedule", schedule), (scheduler, "postprocess", postprocess)):
             self.replace(obj, name, method)
+        original_admit = scheduler._can_admit_prefill
+        def can_admit(seq, cached_blocks):
+            allowed = original_admit(seq, cached_blocks)
+            if not allowed:
+                rid = self.request_id(seq)
+                now = self.now()
+                self.request_stats[rid]["reserve_deferrals"] += 1
+                if rid not in self.pending_reserve_waits:
+                    self.pending_reserve_waits[rid] = dict(request_id=rid, start_time=now, attempts=0)
+                self.pending_reserve_waits[rid]["attempts"] += 1
+                physical_blocks = seq.num_blocks
+                h = -1
+                for i in range(cached_blocks):
+                    h = manager.compute_hash(seq.block(i), h)
+                    physical_blocks -= manager.hash_to_block_id[h] in manager.used_block_ids
+                self.reserve_deferral_events.append(dict(request_id=rid, time=now, step_index=len(self.steps),
+                    cached_blocks=cached_blocks, physical_blocks=physical_blocks,
+                    free_blocks=len(manager.free_block_ids), reserve_blocks=scheduler.kv_reserve_blocks))
+                if self.active_step is not None:
+                    self.active_step["reserve_deferrals"] += 1
+            return allowed
+        self.replace(scheduler, "_can_admit_prefill", can_admit)
         return self
 
 
@@ -269,6 +313,9 @@ def pressure_summary(observer, elapsed):
     recovery = [s for s in observer.steps if s["recomputed_tokens"] > 0]
     pure = [s for s in recovery if s["recomputed_tokens"] == s["prefill_tokens"]]
     total = len(observer.engine.scheduler.block_manager.blocks)
+    waits = [e["duration_s"] for e in observer.reserve_wait_events]
+    first_prefill_waits = [stats["first_prefill_time"] - observer.records[rid].admission_time
+                          for rid, stats in observer.request_stats.items() if stats["first_prefill_time"] is not None]
     return dict(**summary, completion_rate=summary["completed_requests"] / len(records) if records else None,
         itl_p99_s=intervals["p99_s"], itl_max_s=intervals["max_s"],
         peak_used_blocks=observer.peak_used_blocks, peak_block_utilization=observer.peak_used_blocks / total,
@@ -288,7 +335,15 @@ def pressure_summary(observer, elapsed):
         recompute_affected_steps=len(recovery),
         recompute_affected_step_wall_s=sum(s["duration_s"] for s in recovery),
         recompute_only_step_wall_s=sum(s["duration_s"] for s in pure),
-        marginal_preemption_overhead_s=None)
+        marginal_preemption_overhead_s=None,
+        reserve_deferrals=len(observer.reserve_deferral_events),
+        reserve_deferred_requests=sum(s["reserve_deferrals"] > 0 for s in observer.request_stats.values()),
+        reserve_deferred_steps=len({e["step_index"] for e in observer.reserve_deferral_events}),
+        reserve_wait_total_s=sum(waits), reserve_wait_p50_s=percentile(waits, .5),
+        reserve_wait_p95_s=percentile(waits, .95),
+        admission_to_first_prefill_p50_s=percentile(first_prefill_waits, .5),
+        admission_to_first_prefill_p95_s=percentile(first_prefill_waits, .95),
+        decode_mean_batch_size=decode_batch_statistics(observer.steps)["mean_batch_size"])
 
 
 def warmup_pressure(engine, rounds):
@@ -309,7 +364,7 @@ def run_worker(manifest_path, output, pressure, policy, repeat):
     config = manifest["config"]
     specs = [RequestSpec(**{k: v for k, v in r.items() if k != "prompt_tokens"})
              for r in manifest["workloads"][pressure]]
-    identity = dict(**run_identity(policy, repeat), pressure=pressure)
+    identity = dict(**pressure_identity(policy, repeat), pressure=pressure)
     observer = None
     elapsed = None
     environment, resources = {}, None
@@ -328,7 +383,8 @@ def run_worker(manifest_path, output, pressure, policy, repeat):
                      max_model_len=768, max_num_batched_tokens=256, max_num_seqs=4,
                      gpu_memory_utilization=.65, scheduling_policy=identity["scheduling_policy"],
                      max_consecutive_decode_steps=identity["max_consecutive_decode_steps"],
-                     decode_queue_policy=identity["decode_queue_policy"])
+                     decode_queue_policy=identity["decode_queue_policy"],
+                     kv_admission_policy=identity["kv_admission_policy"], kv_reserve_blocks=identity["kv_reserve_blocks"])
         def close():
             atexit.unregister(engine.exit)
             engine.exit()
@@ -338,6 +394,8 @@ def run_worker(manifest_path, output, pressure, policy, repeat):
             physical_blocks = engine.model_runner.kv_cache.shape[2]
             if native_blocks != physical_blocks or native_blocks != engine.model_runner.config.num_kvcache_blocks:
                 raise RuntimeError("physical and managed KV capacities differ")
+            if config.get("expected_blocks") is not None and native_blocks != config["expected_blocks"]:
+                raise RuntimeError(f"expected {config['expected_blocks']} native KV blocks, got {native_blocks}")
             validate_workload(specs, native_blocks, engine.scheduler.block_size,
                               engine.model_runner.config.max_model_len)
             environment.update(gpu_name=torch.cuda.get_device_name(0), torch=torch.__version__,
@@ -381,7 +439,9 @@ def run_worker(manifest_path, output, pressure, policy, repeat):
         run["requests"] = [{**r.to_dict(), **observer.request_stats[r.request_id]}
                            for r in observer.records.values()]
         run.update(steps=observer.steps, preemption_events=observer.preemption_events,
-                   allocation_events=observer.allocation_events)
+                   allocation_events=observer.allocation_events,
+                   reserve_deferral_events=observer.reserve_deferral_events,
+                   reserve_wait_events=observer.reserve_wait_events)
         if resources:
             resources.update(released=not resources["used_blocks"] and not resources["waiting_requests"]
                                       and not resources["running_requests"],
@@ -465,6 +525,33 @@ def validate_pressure_run(run, specs):
             ("recompute_only_step_wall_s", sum(s["duration_s"] for s in pure))):
         if summary[key] != expected:
             raise ValueError("recomputation-associated timing differs")
+    if "reserve_deferral_events" in run:
+        attempts = Counter(e["request_id"] for e in run["reserve_deferral_events"])
+        episodes = {e["request_id"]: e for e in run["reserve_wait_events"]}
+        if len(episodes) != len(run["reserve_wait_events"]) or set(episodes) != set(attempts):
+            raise ValueError("reserve wait episode missing/duplicated")
+        records = {r["request_id"]: r for r in run["requests"]}
+        for event in run["reserve_deferral_events"]:
+            if (event["free_blocks"] - event["physical_blocks"] >= event["reserve_blocks"]
+                    or not records[event["request_id"]]["admission_time"] <= event["time"] <= records[event["request_id"]]["first_prefill_time"]):
+                raise ValueError("invalid reserve deferral")
+        for rid, row in records.items():
+            if (row["reserve_deferrals"] != attempts[rid]
+                    or row["first_prefill_time"] is None
+                    or not row["admission_time"] <= row["first_prefill_time"] <= row["first_token_time"]):
+                raise ValueError("invalid initial Prefill/defer accounting")
+            if rid in episodes:
+                event = episodes[rid]
+                if (event["end_time"] != row["first_prefill_time"] or event["attempts"] != attempts[rid]
+                        or event["duration_s"] != event["end_time"] - event["start_time"]
+                        or event["duration_s"] != row["reserve_wait_s"]):
+                    raise ValueError("reserve duration differs")
+            elif row["reserve_wait_s"] != 0.:
+                raise ValueError("unexplained reserve wait")
+        if (summary["reserve_deferrals"] != sum(attempts.values())
+                or summary["reserve_deferred_requests"] != len(attempts)
+                or summary["reserve_wait_total_s"] != sum(e["duration_s"] for e in run["reserve_wait_events"])):
+            raise ValueError("reserve summary differs")
     return True
 
 
@@ -542,7 +629,8 @@ def verify_results(directory):
         assert_csv_matches(directory / level / "raw_requests.csv", [
             {**{k: r["summary"][k] for k in identities}, **row}
             for r in selected for row in r["requests"]])
-        for field in ("steps", "preemption_events", "allocation_events"):
+        extra_fields = ("reserve_deferral_events", "reserve_wait_events") if any("reserve_deferral_events" in r for r in selected) else ()
+        for field in ("steps", "preemption_events", "allocation_events") + extra_fields:
             expected_rows = [{"policy": r["summary"]["policy"], "repeat": r["summary"]["repeat"], **row}
                              for r in selected for row in r[field]]
             assert_csv_matches(directory / level / f"{field}.csv", expected_rows)
@@ -567,7 +655,8 @@ def collect_results(directory, manifest, runs):
         selected = [r for r in runs if r["summary"]["pressure"] == level]
         subdir = directory / level
         write_results(subdir, selected, dict(config=manifest["config"], pressure=level))
-        for field in ("steps", "preemption_events", "allocation_events"):
+        extra_fields = ("reserve_deferral_events", "reserve_wait_events") if any("reserve_deferral_events" in r for r in selected) else ()
+        for field in ("steps", "preemption_events", "allocation_events") + extra_fields:
             export_csv(subdir / f"{field}.csv", [{"policy": r["summary"]["policy"],
                 "repeat": r["summary"]["repeat"], **row} for r in selected for row in r[field]])
     export_csv(directory / "summary.csv", [r["summary"] for r in runs])
@@ -587,7 +676,9 @@ def main():
     parser.add_argument("--model")
     parser.add_argument("--output-dir", default="results_kv_pressure")
     parser.add_argument("--pressures", nargs="+", choices=tuple(PRESSURES), default=list(PRESSURES))
-    parser.add_argument("--policies", nargs="+", choices=POLICIES, default=list(POLICIES))
+    parser.add_argument("--policies", nargs="+", choices=POLICIES + tuple(ADMISSION_RESERVES), default=list(POLICIES))
+    parser.add_argument("--workload-from", help="reuse exact saved stage-six manifest Token IDs")
+    parser.add_argument("--expected-blocks", type=int)
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--warmup-rounds", type=int, default=2)
     parser.add_argument("--seed", type=int, default=0)
@@ -610,28 +701,39 @@ def main():
         return 0
     if (args.repeats < 1 or args.warmup_rounds < 1 or args.timeout_seconds <= 0
             or not math.isfinite(args.timeout_seconds) or args.max_steps <= 0 or args.no_progress_steps <= 0
+            or (args.expected_blocks is not None and args.expected_blocks <= 0)
             or len(args.pressures) != len(set(args.pressures)) or len(args.policies) != len(set(args.policies))):
         parser.error("invalid repetitions/warmup/limits or duplicate levels/policies")
     directory = Path(args.output_dir).resolve()
     if directory.exists() and any(directory.iterdir()):
         raise ValueError(f"output directory must be empty: {directory}")
     directory.mkdir(parents=True, exist_ok=True)
-    from transformers import AutoTokenizer
     model = str(find_model(args.model))
-    tokenizer = AutoTokenizer.from_pretrained(model, use_fast=True)
-    # Each level is a prefix of the same seeded workload; strategies see exact same IDs.
-    full = make_workload(tokenizer, max(PRESSURES.values()), args.seed)
+    if args.workload_from:
+        saved = json.loads(Path(args.workload_from).read_text())
+        workloads = {level: saved["workloads"][level] for level in args.pressures}
+        if saved["config"]["model"] != model or saved["config"]["seed"] != args.seed:
+            raise ValueError("saved workload model/seed differs")
+        if any(len(workloads[level]) != PRESSURES[level] for level in args.pressures):
+            raise ValueError("saved workload request count differs")
+    else:
+        from transformers import AutoTokenizer
+        tokenizer = AutoTokenizer.from_pretrained(model, use_fast=True)
+        full = make_workload(tokenizer, max(PRESSURES.values()), args.seed)
+        workloads = {level: [s.to_dict() for s in full[:PRESSURES[level]]] for level in args.pressures}
     config = dict(model=model, seed=args.seed, repeats=args.repeats, warmup_rounds=args.warmup_rounds,
                   timeout_seconds=args.timeout_seconds, max_steps=args.max_steps,
                   no_progress_steps=args.no_progress_steps, pressures=args.pressures, policies=args.policies,
                   max_model_len=768, max_num_batched_tokens=256, max_num_seqs=4,
                   tensor_parallel_size=1, enforce_eager=True, gpu_memory_utilization=.65,
-                  kvcache_block_size=256, capacity_mode="native automatic; no capacity override")
-    source_names = ("benchmarks/kv_pressure_bench.py", "benchmarks/mixed_load_bench.py",
+                  kvcache_block_size=256, capacity_mode="native automatic; no capacity override",
+                  expected_blocks=args.expected_blocks,
+                  workload_from=str(Path(args.workload_from).resolve()) if args.workload_from else None)
+    source_names = ("benchmarks/kv_pressure_bench.py", "benchmarks/mixed_load_bench.py", "nanovllm/config.py",
                     "nanovllm/engine/scheduler.py", "nanovllm/engine/block_manager.py",
                     "nanovllm/engine/model_runner.py")
-    manifest = dict(config=config, workloads={level: [s.to_dict() for s in full[:PRESSURES[level]]]
-                                              for level in args.pressures},
+    manifest = dict(config=config, workloads=workloads,
+                    policy_configurations={p: pressure_identity(p, 0) for p in args.policies},
                     timestamp_utc=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                     git_head=subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
                     source_sha256={n: hashlib.sha256(Path(n).read_bytes()).hexdigest() for n in source_names},
@@ -640,6 +742,8 @@ def main():
     manifest_path = directory / "manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n")
     (directory / "instrumentation_source.py").write_bytes(Path(__file__).read_bytes())
+    for name in source_names[2:]:
+        (directory / (Path(name).stem + "_source.py")).write_bytes(Path(name).read_bytes())
     (directory / "runs").mkdir()
     runs, capacities = [], set()
     for repeat in range(args.repeats):
@@ -662,7 +766,7 @@ def main():
                 if result.returncode or not output.exists():
                     raise RuntimeError(f"worker failed ({result.returncode}); retained results: {output}; log: {log_path}")
                 run = json.loads(output.read_text())
-                specs = [s for s in full[:PRESSURES[level]]]
+                specs = [RequestSpec(**{k: v for k, v in r.items() if k != "prompt_tokens"}) for r in workloads[level]]
                 validate_pressure_run(run, specs)
                 capacities.add(run["summary"]["num_kvcache_blocks"])
                 if len(capacities) != 1:
